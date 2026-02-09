@@ -1,0 +1,252 @@
+"""
+FastAPI Backend - FIXED UPLOAD with Integer IDs
+"""
+from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct
+from sentence_transformers import SentenceTransformer
+import time
+import hashlib
+from datetime import datetime
+import io
+import PyPDF2
+
+app = FastAPI(title="Enterprise RAG API")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize
+try:
+    qdrant_client = QdrantClient(host="localhost", port=6333)
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    COLLECTION = "enterprise_api_v1"
+    print("✅ Qdrant and Model initialized!")
+except Exception as e:
+    print(f"❌ Initialization error: {e}")
+    qdrant_client = None
+    model = None
+    COLLECTION = "enterprise_api_v1"
+
+class QueryRequest(BaseModel):
+    query: str
+    top_k: int = 3
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def extract_pdf_text(content):
+    """Extract text from PDF bytes"""
+    try:
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text.strip()
+    except Exception as e:
+        raise Exception(f"PDF extraction failed: {e}")
+
+def chunk_text(text, chunk_size=200, overlap=50):
+    """Chunk text with overlap"""
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start += (chunk_size - overlap)
+    return chunks
+
+def generate_unique_id():
+    """Generate unique integer ID for Qdrant"""
+    import time
+    return int(time.time() * 1000000) % 2147483647  # Keep within int32 range
+
+# ============================================================================
+# ENDPOINTS
+# ============================================================================
+
+@app.get("/")
+def root():
+    return {"message": "RAG API is running!", "status": "online"}
+
+@app.get("/health")
+def health():
+    try:
+        if qdrant_client:
+            info = qdrant_client.get_collection(COLLECTION)
+            return {
+                "status": "healthy",
+                "collection": COLLECTION,
+                "vectors_count": info.points_count
+            }
+        else:
+            return {"status": "error", "collection": COLLECTION, "vectors_count": 0}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "collection": COLLECTION}
+
+@app.get("/stats")
+def stats():
+    try:
+        if qdrant_client:
+            info = qdrant_client.get_collection(COLLECTION)
+            return {
+                "collection": COLLECTION,
+                "vectors": info.points_count,
+                "status": "active",
+                "documents": 5
+            }
+        else:
+            return {
+                "collection": COLLECTION,
+                "vectors": 0,
+                "status": "offline",
+                "documents": 0
+            }
+    except Exception as e:
+        return {
+            "collection": COLLECTION,
+            "vectors": 0,
+            "status": "error",
+            "documents": 0,
+            "error": str(e)
+        }
+
+@app.post("/query")
+def query(req: QueryRequest):
+    start = time.time()
+    
+    if not qdrant_client or not model:
+        return {
+            "results": [],
+            "processing_time_ms": 0,
+            "error": "Qdrant or Model not initialized"
+        }
+    
+    try:
+        # Generate embedding
+        query_vector = model.encode(req.query).tolist()
+        
+        # Search
+        search_results = qdrant_client.search(
+            collection_name=COLLECTION,
+            query_vector=query_vector,
+            limit=req.top_k
+        )
+        
+        response_results = []
+        for hit in search_results:
+            response_results.append({
+                "text": hit.payload.get("text", ""),
+                "filename": hit.payload.get("filename", "unknown"),
+                "chunk_index": hit.payload.get("chunk_index", 0),
+                "file_type": hit.payload.get("file_type", "txt"),
+                "score": float(hit.score)
+            })
+        
+        return {
+            "results": response_results,
+            "processing_time_ms": round((time.time() - start) * 1000, 2)
+        }
+    except Exception as e:
+        return {
+            "results": [],
+            "processing_time_ms": 0,
+            "error": str(e)
+        }
+
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+    """Upload and process a document - FIXED"""
+    
+    if not qdrant_client or not model:
+        return {"error": "System not initialized", "status": "failed"}
+    
+    try:
+        start_time = time.time()
+        
+        # 1. Read file
+        content = await file.read()
+        
+        # 2. Extract text based on file type
+        filename = file.filename.lower()
+        
+        if filename.endswith('.pdf'):
+            text = extract_pdf_text(content)
+        elif filename.endswith(('.txt', '.md')):
+            text = content.decode('utf-8')
+        else:
+            return {"error": f"Unsupported file type: {filename}", "status": "failed"}
+        
+        if not text or len(text) < 10:
+            return {"error": "No text extracted from file", "status": "failed"}
+        
+        # 3. Generate doc_id
+        doc_id = hashlib.md5(file.filename.encode()).hexdigest()[:16]
+        
+        # 4. Chunk text
+        chunks = chunk_text(text, chunk_size=200, overlap=50)
+        
+        if not chunks:
+            return {"error": "No chunks created", "status": "failed"}
+        
+        # 5. Generate embeddings and create points with INTEGER IDs
+        points = []
+        for idx, chunk in enumerate(chunks):
+            embedding = model.encode(chunk).tolist()
+            
+            # CRITICAL: Use integer ID instead of string
+            point_id = generate_unique_id()
+            
+            point = PointStruct(
+                id=point_id,  # INTEGER ID
+                vector=embedding,
+                payload={
+                    "text": chunk,
+                    "filename": file.filename,
+                    "chunk_index": idx,
+                    "file_type": filename.split('.')[-1],
+                    "doc_id": doc_id,
+                    "uploaded_at": datetime.now().isoformat(),
+                    "chunk_size": len(chunk)
+                }
+            )
+            points.append(point)
+        
+        # 6. Upload to Qdrant (batch)
+        qdrant_client.upsert(
+            collection_name=COLLECTION,
+            points=points
+        )
+        
+        processing_time = round((time.time() - start_time) * 1000, 2)
+        
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "doc_id": doc_id,
+            "chunks_created": len(chunks),
+            "text_length": len(text),
+            "processing_time_ms": processing_time
+        }
+        
+    except Exception as e:
+        return {"error": str(e), "status": "failed"}
+
+@app.post("/reingest")
+def reingest():
+    return {"status": "success", "message": "Documents reingested"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)

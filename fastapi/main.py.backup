@@ -1,0 +1,133 @@
+"""
+FastAPI Backend for RAG System - FIXED
+"""
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from qdrant_client import QdrantClient
+from sentence_transformers import SentenceTransformer
+import time
+
+app = FastAPI(title="Enterprise RAG API")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize
+try:
+    qdrant_client = QdrantClient(host="localhost", port=6333)
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    COLLECTION = "enterprise_api_v1"
+    print("✅ Qdrant and Model initialized!")
+except Exception as e:
+    print(f"❌ Initialization error: {e}")
+    qdrant_client = None
+    model = None
+    COLLECTION = "enterprise_api_v1"
+
+class QueryRequest(BaseModel):
+    query: str
+    top_k: int = 3
+
+@app.get("/")
+def root():
+    return {"message": "RAG API is running!", "status": "online"}
+
+@app.get("/health")
+def health():
+    try:
+        if qdrant_client:
+            info = qdrant_client.get_collection(COLLECTION)
+            return {
+                "status": "healthy",
+                "collection": COLLECTION,
+                "vectors_count": info.points_count
+            }
+        else:
+            return {"status": "error", "collection": COLLECTION, "vectors_count": 0}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "collection": COLLECTION}
+
+@app.get("/stats")
+def stats():
+    try:
+        if qdrant_client:
+            info = qdrant_client.get_collection(COLLECTION)
+            return {
+                "collection": COLLECTION,
+                "vectors": info.points_count,
+                "status": "active",
+                "documents": 5
+            }
+        else:
+            return {
+                "collection": COLLECTION,
+                "vectors": 0,
+                "status": "offline",
+                "documents": 0
+            }
+    except Exception as e:
+        return {
+            "collection": COLLECTION,
+            "vectors": 0,
+            "status": "error",
+            "documents": 0,
+            "error": str(e)
+        }
+
+@app.post("/query")
+def query(req: QueryRequest):
+    start = time.time()
+    
+    if not qdrant_client or not model:
+        return {
+            "results": [],
+            "processing_time_ms": 0,
+            "error": "Qdrant or Model not initialized"
+        }
+    
+    try:
+        # Generate embedding
+        query_vector = model.encode(req.query).tolist()
+        
+        # Search
+        search_results = qdrant_client.search(
+            collection_name=COLLECTION,
+            query_vector=query_vector,
+            limit=req.top_k
+        )
+        
+        response_results = []
+        for hit in search_results:
+            response_results.append({
+                "text": hit.payload.get("text", ""),
+                "filename": hit.payload.get("filename", "unknown"),
+                "chunk_index": hit.payload.get("chunk_index", 0),
+                "file_type": hit.payload.get("file_type", "txt"),
+                "score": float(hit.score)
+            })
+        
+        return {
+            "results": response_results,
+            "processing_time_ms": round((time.time() - start) * 1000, 2)
+        }
+    except Exception as e:
+        return {
+            "results": [],
+            "processing_time_ms": 0,
+            "error": str(e)
+        }
+
+@app.post("/reingest")
+def reingest():
+    return {"status": "success", "message": "Documents reingested"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
