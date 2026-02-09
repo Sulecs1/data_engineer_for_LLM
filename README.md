@@ -321,6 +321,4 @@ MIT
 **Last Updated**: February 9, 2026  
 **Status**: Production Ready 
 by Şule Akçay
-EOF
 
-echo "✅ New README.md created!"
