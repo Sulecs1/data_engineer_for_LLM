@@ -1,4 +1,4 @@
-cat > ~/rag-pipeline-v1/README.md << 'EOF'
+
 # 🚀 Production RAG System with Apache Iceberg
 
 Enterprise-grade Retrieval-Augmented Generation (RAG) system combining modern data lake architecture with AI-powered semantic search.
